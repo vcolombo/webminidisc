@@ -11,18 +11,19 @@ essentially unchanged.
 
 ## Scope (revised)
 
-**v1 = NetMD only.** NetMD is a USB vendor-class device — libusb/`nusb` claims
-it cleanly on macOS. This is the shippable target.
+**v1 = NetMD + Full HiMD.** Both are in scope.
 
-**Full HiMD is out of v1 — gated investigation.** Full HiMD enumerates as USB
-Mass Storage; on macOS the kernel driver owns that interface. The chosen `nusb`
-backend cannot detach a kernel driver on macOS (`detach_kernel_driver` /
-`detach_and_claim_interface` are Linux-only, no-ops elsewhere), and unmounting
-the volume is not documented to release the interface claim. There is **no
-demonstrated macOS strategy** for taking exclusive access. Full HiMD support is
-therefore a separate spike (see "HiMD gate" below), not a milestone of v1. HiMD
-read-only/filesystem features that do not require raw SCSI control may still be
-in reach — to be confirmed by the spike, not assumed.
+- **NetMD** is a USB vendor-class device — `nusb` claims it cleanly on macOS.
+  Straightforward.
+- **Full HiMD** enumerates as USB Mass Storage (class `0x08`); the macOS kernel
+  driver owns that interface and auto-mounts the volume. `nusb` cannot detach a
+  kernel driver on macOS. **But the ecosystem already solves this without
+  needing to detach:** the `netmd-exploits` `HiMDUSBClassOverride` exploit
+  firmware-patches the device's USB interface descriptor to **vendor class
+  `0xFF`** (and VID/PID `"ASVR"`), so it re-enumerates as a non-mass-storage
+  device that no kernel driver claims — on every OS, macOS included. This is
+  exactly how the Chromium web app does Full HiMD on macOS today. See "HiMD USB
+  access" below. Fallbacks exist if the bootstrap step misbehaves on macOS.
 
 ## Constraints & decisions
 
@@ -156,6 +157,49 @@ carrying a stable device identity (per the API audit). Shim builds a
 WebUSB-shaped `{ device }` event → `navigator.usb.ondisconnect`
 (`src/index.tsx:46`). Connect events not wired (app doesn't auto-connect).
 
+## Component: HiMD USB access (class-override bootstrap)
+
+Full HiMD works by turning the device into a vendor-class device before doing
+raw I/O. The exploit is pure JS in `netmd-exploits`, driven **through the same
+`navigator.usb` shim** — no extra native surface beyond what the shim already
+exposes, provided the shim supports the two things below.
+
+Flow (matches the browser's proven macOS path):
+
+1. **Bootstrap (the one macOS unknown).** Device is still mass-storage; the
+   kernel driver owns the bulk interface. `netmd-exploits` enters HiMD factory
+   mode and applies `HiMDUSBClassOverride` — patching the USB descriptor to
+   class `0xFF`, VID/PID `"ASVR"`. These factory commands ride **EP0 control
+   transfers**, which do **not** require claiming the owned bulk interface —
+   which is why WebUSB (and macOS) permit them despite the class-08 block.
+   **Requirement:** the shim/backend must support **device-level control
+   transfers** independent of interface claim.
+2. **Re-enumeration.** After the patch the device drops and reappears as an
+   `ASVR` vendor-class device. **Requirement:** the shim must survive this —
+   `ondisconnect` fires for the old device, hotplug surfaces the new `ASVR`
+   device, and the flow re-opens it. himd-js/webminidisc already orchestrate
+   this dance in the browser; the shim must not swallow it.
+3. **Direct SCSI.** The `ASVR` device is vendor class → `nusb` claims it
+   cleanly (identical to NetMD from here) → himd-js Direct mode issues SCSI over
+   bulk. Full read/write/DRM works.
+
+**The single de-risking question:** can `nusb` issue the factory EP0 control
+transfers on macOS while the device is still mass-storage (kernel driver owning
+the bulk interface)? Chrome proves it's possible in principle; `nusb` must be
+confirmed on real hardware early (Milestone 3a).
+
+**Fallbacks, in order, if the `nusb` EP0 bootstrap fails on macOS:**
+
+1. **`rusb` (libusb) backend.** libusb added macOS kernel-driver detach via
+   whole-device capture (libusb PR #911). Swap the Rust backend from `nusb` to
+   `rusb` for HiMD (or entirely) and use device capture to reach EP0 / claim.
+2. **Restricted (volume) mode.** himd-js supports pointing at the mounted
+   `/Volumes/<disc>` filesystem — read-only/filesystem features, no raw USB.
+   Feature floor if full DRM transfer can't be bootstrapped.
+
+Decision: build on `nusb` + EP0 bootstrap first (Milestone 3a proves it); keep
+`rusb` capture as the designed-in fallback, restricted mode as the floor.
+
 ## Component: native-bridge feature parity (new — was under-stated)
 
 A `navigator.usb` shim alone is **not** full parity. The app already has an
@@ -167,7 +211,7 @@ gets an explicit disposition for the Tauri build:
 |---|---|
 | `window.native.interface` (NetMD native path) | **Redesign** — served by the `navigator.usb` shim; keep the web WebUSB path for the browser build. |
 | `nwInterface` (NetworkWM) | Confirm during audit; likely web-path reuse. |
-| `himdFullInterface` (Full HiMD native) | **Dropped from v1** — blocked by HiMD gate. |
+| `himdFullInterface` (Full HiMD native) | **In v1** — served by the `navigator.usb` shim + class-override bootstrap (see "HiMD USB access"). |
 | `unrestrictedFetchJSON` (Shazam CORS bypass, `src/redux/actions.ts:1102`) | **Redesign** — route via a Tauri HTTP command (no browser CORS); or disable Song Recognition in v1 if deferred. |
 | Local ATRAC encoder bridge | Confirm need; web/WASM encoders already exist in-app. |
 | Native dialogs | Optional; Tauri dialog plugin if used. |
@@ -210,8 +254,11 @@ App loads FFmpeg workers (`src/utils.ts:540`), ATRAC workers
 1. **Bundle:** `tauri build` → `.app` + `.dmg`.
 2. **Codesign:** Developer ID Application cert; hardened runtime on.
 3. **USB under hardened runtime:** non-sandboxed → `nusb` USB access works with
-   **no** entitlement (`com.apple.security.device.usb` is sandbox-only). Real
-   blocker is kernel-driver ownership (HiMD), not hardened runtime.
+   **no** entitlement (`com.apple.security.device.usb` is sandbox-only). HiMD's
+   kernel-driver ownership is handled by the class-override bootstrap (see "HiMD
+   USB access"), not by entitlements. If the `rusb`/libusb capture fallback is
+   used, verify device capture also needs no special entitlement outside the
+   sandbox.
 4. **Privacy usage strings (gap):** the app uses `getUserMedia` for
    microphone/line-in recording (`src/services/browserintegration/
    mediarecorder.ts:46`). Info.plist **must** include
@@ -232,40 +279,42 @@ App loads FFmpeg workers (`src/utils.ts:540`), ATRAC workers
 
 ## Known risks
 
-1. **HiMD kernel-driver ownership (v1 blocker → out of scope).** No demonstrated
-   `nusb`/macOS strategy for exclusive access to the mass-storage interface. See
-   HiMD gate. NetMD unaffected.
-2. **Binary IPC perf.** Multi-MB bulk over IPC — validated by the corrected
+1. **HiMD EP0 control bootstrap on macOS (single biggest unknown).** Can `nusb`
+   issue the factory EP0 control transfers while the mass-storage kernel driver
+   owns the bulk interface? Proven possible in Chrome; must be confirmed on real
+   hardware at Milestone 3a. Fallbacks designed in: `rusb`/libusb device
+   capture, then restricted (volume) mode. See "HiMD USB access."
+2. **Re-enumeration handling.** After class override the device disconnects and
+   reappears as `ASVR`; the shim must survive the drop/reappear cycle, not treat
+   it as a fatal disconnect.
+3. **Binary IPC perf.** Multi-MB bulk over IPC — validated by the corrected
    `Response`/raw-request/`Channel` design + real-hardware benchmark.
-3. **Chatty NetMD control polling latency.** Each poll is an IPC round-trip;
+4. **Chatty NetMD control polling latency.** Each poll is an IPC round-trip;
    measure on real hardware early.
-4. **Transfer timeouts / mid-op disconnect.** Bulk reads block; per-call
+5. **Transfer timeouts / mid-op disconnect.** Bulk reads block; per-call
    timeouts + clean rejection so unplug/reset fails the promise, not hangs.
-
-## HiMD gate (separate spike, not v1)
-
-Before promising any Full HiMD support on macOS, prove exclusive access to a
-kernel-driver-owned mass-storage interface — e.g. an IOKit-level approach
-outside `nusb`, a different backend, or an authorized unmount+claim sequence.
-If unproven, Full HiMD stays unsupported on native macOS and users keep using
-the Chromium web app for it. This is a research task with a binary outcome, not
-a build milestone.
 
 ## Milestones (revised, de-risk order)
 
 1. **Tauri shell** wraps the current build, no USB. Acceptance gate: FFmpeg / v86
    / all workers / WASM run in WKWebView with `crossOriginIsolated`, dev **and**
    prod headers. Retires the web-stack risk.
-2. **WebUSB API audit** — extract tarballs, produce the call-site matrix.
+2. **WebUSB API audit** — extract tarballs, produce the call-site matrix
+   (include device-level control transfers needed for the HiMD bootstrap).
 3. **NetMD USB bridge + shim** — one real NetMD device round-trips (list, open,
-   read TOC, list tracks, transfer a track) over the corrected binary IPC; benchmarked.
-4. **Native-bridge parity** — Shazam fetch redesign (or defer), Remote NetMD CSP
+   read TOC, list tracks, transfer a track) over the corrected binary IPC;
+   benchmarked.
+   - **3a. HiMD bootstrap spike (do early — highest-risk item).** On real HiMD
+     hardware: `nusb` EP0 control transfers → apply `HiMDUSBClassOverride` →
+     survive re-enumeration → claim `ASVR` device. If it fails, switch to the
+     `rusb`/libusb capture fallback before building further HiMD on `nusb`.
+4. **HiMD full path** — Direct SCSI read/write/DRM through the shim on the
+   `ASVR` device; restricted (volume) mode wired as the read-only floor.
+5. **Native-bridge parity** — Shazam fetch redesign (or defer), Remote NetMD CSP
    decision, hotplug/picker.
-5. **Sign / notarize / DMG** (universal) + release checklist.
-6. **HiMD gate** — separate spike; only then decide native HiMD scope.
+6. **Sign / notarize / DMG** (universal) + release checklist.
 
 ## Out of scope (deliberate)
 
-Full HiMD on native macOS (pending gate); auto-update; Windows/Linux Tauri
-builds (bridge is cross-platform, near-free later); Mac App Store; in-app
-licensing.
+Auto-update; Windows/Linux Tauri builds (bridge is cross-platform, near-free
+later); Mac App Store; in-app licensing. (Full HiMD is now **in** v1.)
